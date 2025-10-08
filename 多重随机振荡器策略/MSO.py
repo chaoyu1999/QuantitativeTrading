@@ -12,11 +12,12 @@ from email.mime.text import MIMEText
 from email.header import Header
 import asyncio
 from dotenv import load_dotenv
+
 load_dotenv()  # 从.env文件加载环境变量
 
 # 参数设置
 _PROXY = True
-Top_Symbols = 3 # 成交量排名前top的币
+Top_Symbols = 20  # 成交量排名前top的币
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,16 +26,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 last_seen = {}
 # 各个 timeframe 对应的分钟数
 timeframe_minutes = {
-    "1m": 1,
     "3m": 3,
     "5m": 5,
     "15m": 15,
     "30m": 30,
     "1h": 60,
-    "2h": 120,
     "4h": 240,
+    "12h": 720,
     "1d": 1440,
-    "1w": 10080
 }
 
 
@@ -58,6 +57,7 @@ def can_use_subject(subject, timeframe):
         # 还没到冷却时间，不允许使用
         return False
 
+
 class MultiStochasticStrategy:
     """多重随机振荡器策略(url:https://cn.tradingview.com/v/qT7M70Aw/)"""
 
@@ -75,6 +75,8 @@ class MultiStochasticStrategy:
         self.params = {}
         # 初始化参数
         self.setup_parameters()
+        # 是否之前出现过超卖
+        self.signal_oversold = {}  # 举例：{symbal: True }
 
     def setup_parameters(self):
         """根据配置模式设置参数"""
@@ -156,15 +158,9 @@ class MultiStochasticStrategy:
 
         return k_final, d_final
 
-    def calculate_all_stochastics(self, df: pd.DataFrame) -> Dict[str, Tuple[float, float]]:
+    def calculate_all_stochastics(self, df: pd.DataFrame) -> dict[str, pd.Series]:
         """
-        计算所有随机振荡器指标
-
-        Args:
-            df: 包含OHLCV数据的DataFrame
-
-        Returns:
-            Dict: 包含所有K/D值的字典
+        计算所有随机振荡器指标，返回完整Series
         """
         results = {}
 
@@ -175,46 +171,76 @@ class MultiStochasticStrategy:
                 self.extra_smooth
             )
 
-            # 获取最新值
-            k_value = k.iloc[-1] if not k.isna().iloc[-1] else None
-            d_value = d.iloc[-1] if not d.isna().iloc[-1] else None
-
-            results[f'k{i}'] = k_value
-            results[f'd{i}'] = d_value
-            results[f'{key}_k'] = k_value
-            results[f'{key}_d'] = d_value
+            # 直接返回Series
+            results[f'k{i}'] = k
+            results[f'd{i}'] = d
+            results[f'{key}_k'] = k
+            results[f'{key}_d'] = d
 
         return results
 
-    def generate_signals(self, stoch_values: Dict) -> Dict[str, bool]:
+    def generate_signals(self, stoch_values: Dict, symbal: str = "", bar: str = "", buy_bar: str = "") -> Dict[
+        str, bool]:
         """
         生成交易信号
 
         Args:
             stoch_values: 随机振荡器数值字典
-
+            symbal: 币种
+            bar: K线分时
+            buy_bar: 买入信号产生的分时K线
         Returns:
             Dict: 包含各种信号的字典
         """
         signals = {}
 
-        # 提取K值
-        k_values = [stoch_values[f'k{i}'] for i in range(1, 5) if stoch_values[f'k{i}'] is not None]
-        d_values = [stoch_values[f'd{i}'] for i in range(1, 5) if stoch_values[f'd{i}'] is not None]
+        # 先收集所有Series
+        k_series_list = [stoch_values.get(f'k{i}') for i in range(1, 5) if stoch_values.get(f'k{i}') is not None]
+        d_series_list = [stoch_values.get(f'd{i}') for i in range(1, 5) if stoch_values.get(f'd{i}') is not None]
 
-        if not k_values or not d_values:
-            return signals
+        # 如果没有有效数据，直接返回
+        if not k_series_list or not d_series_list:
+            return {}
 
-        # 超卖信号：所有K/D值都小于20
-        signals['oversold'] = all(k < 20 for k in k_values) and all(d < 20 for d in d_values)
+        # 多条Series按行比较：先初始化True Series
+        # 用第一个Series的索引来对齐
+        oversold_signal = pd.Series(True, index=k_series_list[0].index)
+        overbought_signal = pd.Series(True, index=k_series_list[0].index)
 
-        # 超买信号：所有K/D值都大于80
-        signals['overbought'] = all(k > 80 for k in k_values) and all(d > 80 for d in d_values)
+        # 依次叠加判断条件
+        for ks in k_series_list:
+            oversold_signal &= (ks < 20)
+            overbought_signal &= (ks > 80)
 
-        return signals
+        for ds in d_series_list:
+            oversold_signal &= (ds < 20)
+            overbought_signal &= (ds > 80)
 
+        # 转为列表
+        signals['oversold'] = oversold_signal.tolist()
+        signals['overbought'] = overbought_signal.tolist()
 
+        # 记录目标分时K线的超卖信号
+        if buy_bar == bar:
+            if signals['oversold'][-1]:
+                self.signal_oversold[symbal] = True
 
+        # 之前有超卖信号，判断右侧抄底信号，并取消超卖信号
+        right_buy_signal = False
+        if bar == buy_bar:
+            if self.signal_oversold.get(symbal, None):  # 之前有超卖
+                # 取除了最后一个 Series 外的所有 Series 的最后一个值
+                k_values_before_last_series = [s.iloc[-1] for s in k_series_list[:-1] if not s.empty]
+                d_values_before_last_series = [s.iloc[-1] for s in d_series_list[:-1] if not s.empty]
+                all_kd = k_values_before_last_series + d_values_before_last_series
+
+                # 判断所有短中线指标是否都大于20。脱离超卖，反转时右侧进场机会
+                if all_kd and all(v > 20 for v in all_kd):
+                    right_buy_signal = True
+                    self.signal_oversold[symbal] = False
+
+        return {'oversold': signals['oversold'][-1], 'overbought': signals['overbought'][-1],
+                "right_buy_signal": right_buy_signal}
 
 
 class TradingBot:
@@ -234,11 +260,11 @@ class TradingBot:
 
         # ✅ 邮箱配置
         self.email_list = self.load_email_list("emails.txt")  # 从文件加载邮箱列表
-        self.email_from = os.getenv("EMAIL_FROM")               # 无默认值，若缺失会返回None
+        self.email_from = os.getenv("EMAIL_FROM")  # 无默认值，若缺失会返回None
         self.smtp_server = os.getenv("SMTP_SERVER")
-        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))     # 带默认值 + 类型转换
+        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))  # 带默认值 + 类型转换
         self.smtp_user = os.getenv("SMTP_USER")
-        self.smtp_pass = os.getenv("SMTP_PASS")                 # 敏感信息安全读取
+        self.smtp_pass = os.getenv("SMTP_PASS")  # 敏感信息安全读取
 
         # 时间周期配置
         self.timeframes = list(timeframe_minutes.keys())
@@ -249,6 +275,9 @@ class TradingBot:
 
         # 初始化交易所
         self.exchange = self.setup_exchange()
+
+        # 抄底K线分时
+        self.bar_k = os.getenv("BAR_K", "15m")
 
     # ===========================
     # 邮箱与交易所配置
@@ -268,10 +297,10 @@ class TradingBot:
         """设置交易所连接"""
         if _PROXY:
             return ccxt.okx({
-               'proxies': {
-                   'http': 'http://127.0.0.1:60000',
-                   'https': 'http://127.0.0.1:60000',
-               },
+                'proxies': {
+                    'http': 'http://127.0.0.1:60000',
+                    'https': 'http://127.0.0.1:60000',
+                },
                 'options': {
                     'defaultType': 'swap',
                 },
@@ -282,11 +311,14 @@ class TradingBot:
                     'defaultType': 'swap',
                 },
             })
+
     # ===========================
     # 邮件发送部分
     # ===========================
     def send_email(self, subject: str, content: str) -> bool:
         """发送邮件给所有收件人"""
+        self.email_list = self.load_email_list("emails.txt")  # 从文件加载邮箱列表
+
         if not self.email_list:
             logging.error("未找到收件人邮箱，邮件未发送。")
             return False
@@ -333,13 +365,14 @@ class TradingBot:
                 server = None
         return False
 
-
     async def send_email_async(self, subject: str, content: str, max_retries: int = 3,
                                retry_delay: float = 5.0) -> bool:
         """异步发送邮件给所有收件人，包含重试机制"""
 
         import asyncio
         from async_timeout import timeout
+        self.email_list = self.load_email_list("emails.txt")  # 从文件加载邮箱列表
+
         if not self.email_list:
             logging.error("未找到收件人邮箱，邮件未发送。")
             return False
@@ -397,7 +430,6 @@ class TradingBot:
 
         return False
 
-
     # ===========================
     # 数据与策略逻辑部分
     # ===========================
@@ -425,6 +457,7 @@ class TradingBot:
                     continue
 
             filtered.sort(key=lambda x: x[1], reverse=True)
+            count = count if count < len(filtered) else len(filtered)
             top_symbols = [s[0] for s in filtered[:count]]
             logging.info(f"获取到 {len(top_symbols)} 个交易对")
             return top_symbols
@@ -454,7 +487,6 @@ class TradingBot:
                 ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
 
                 if not ohlcv or len(ohlcv) < 100:
-                    logging.warning(f"{symbol} {timeframe} K线数据不足 ({len(ohlcv)}) 条")
                     return None
 
                 df = pd.DataFrame(
@@ -472,7 +504,7 @@ class TradingBot:
                     # 计算退避时间：base_delay * 2^attempt + 随机扰动
                     delay = base_delay * (2 ** attempt) + random.uniform(0.2, 1.0)
                     logging.warning(
-                        f"⚠️ {symbol} {timeframe} 请求过于频繁，{attempt+1}/{max_retries} 次重试，"
+                        f"⚠️ {symbol} {timeframe} 请求过于频繁，{attempt + 1}/{max_retries} 次重试，"
                         f"等待 {delay:.2f} 秒..."
                     )
                     time.sleep(delay)
@@ -493,8 +525,8 @@ class TradingBot:
             if df is None:
                 return {}
 
-            stoch_values = self.strategy.calculate_all_stochastics(df)
-            signals = self.strategy.generate_signals(stoch_values)
+            stoch_values = self.strategy.calculate_all_stochastics(df)  # 计算所有随机振荡器指标
+            signals = self.strategy.generate_signals(stoch_values, symbol, timeframe, self.bar_k)  # 获取信号
 
             return {
                 'symbol': symbol,
@@ -507,24 +539,27 @@ class TradingBot:
             logging.error(f"分析 {symbol} {timeframe} 时出错: {e}")
             return {}
 
-
     # ===========================
     # 主监控逻辑
     # ===========================
     async def run_monitoring(self):
         """运行监控循环"""
         try:
-            symbols = list(set(self.get_top_symbols(Top_Symbols) + self.get_custom_symbols()))
-            symbols.sort()
-            logging.info(f"开始监控 {len(symbols)} 个交易对")
 
             while True:
+                symbols = list(set(self.get_top_symbols(Top_Symbols)))
+                symbols.sort()
+                custom_symbols = self.get_custom_symbols()
+                # 去重：确保custom_symbols中的元素不会重复出现在后面的symbols中
+                symbols = custom_symbols + [s for s in symbols if s not in custom_symbols]
+                logging.info(f"开始监控 {len(symbols)} 个交易对")
                 content = ""
+                last_content = None
                 for symbol in symbols:
                     _symbol_content = ""
                     for timeframe in self.timeframes:
                         try:
-                            analysis = self.analyze_symbol(symbol, timeframe)
+                            analysis = self.analyze_symbol(symbol, timeframe)  # 获取信号
                             if not analysis:
                                 continue
 
@@ -534,21 +569,27 @@ class TradingBot:
                                 alert_signals.append(('OVERSOLD', '超卖信号'))
                             if signals.get('overbought'):
                                 alert_signals.append(('OVERBOUGHT', '超买信号'))
+                            if signals.get('right_buy_signal'):
+                                alert_signals.append(('right_buy_signal', '右侧买入信号'))
                             for sig_key, sig_name in alert_signals:
                                 subject = ""
-                                if signals.get('oversold'):
-                                    # 红色看多
-                                    subject = f'<div style="font-weight: bold; color: red;">{symbol} {timeframe} - {sig_name}</div>\n'
+                                if signals.get('oversold') or signals.get('right_buy_signal'):
+                                    if signals.get('oversold'):
+                                        # 红色看多
+                                        subject = f'<div style="font-weight: bold; color: #ffaaa5;">{symbol} {timeframe} - {sig_name}</div>\n'
+                                    if signals.get('right_buy_signal'):
+                                        # 红色看多
+                                        subject = f'<div style="font-weight: bold; color: #ea5455;">{symbol} {timeframe} - {sig_name}</div>\n'
                                 if signals.get('overbought'):
                                     # 绿色看空
-                                    subject = f'<div style="font-weight: bold; color: green;">{symbol} {timeframe} - {sig_name}</div>\n'
+                                    subject = f'<div style="font-weight: bold; color: #a8e6cf;">{symbol} {timeframe} - {sig_name}</div>\n'
                                 _symbol_content += subject
                         except Exception as e:
                             logging.error(f"处理 {symbol} {timeframe} 时出错: {e}")
                             continue
                     if _symbol_content != "":
                         content = content + _symbol_content + "<br>\n"
-                if content != "":
+                if content != "" and last_content != content:  # 内容不为空，且和上次不一样则发邮件
                     # 异步发送
                     from datetime import datetime
                     # 获取当前时间
@@ -556,8 +597,9 @@ class TradingBot:
                     # 格式化为字符串（年月日时分秒）
                     time_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
                     await self.send_email_async(time_str + "-订阅信息", content)
+                    last_content = content
                 logging.info("本轮监控完成，等待下一轮...")
-                time.sleep(5*60)
+                time.sleep(3 * 60)  # 3min 扫描一次
         except KeyboardInterrupt:
             logging.info("用户中断程序")
         except Exception as e:
@@ -567,6 +609,4 @@ class TradingBot:
 if __name__ == "__main__":
     # 创建交易机器人实例
     bot = TradingBot(config_mode="Custom")
-
     asyncio.run(bot.run_monitoring())
-
